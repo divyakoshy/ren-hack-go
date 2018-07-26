@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -15,24 +18,42 @@ import (
 )
 
 type Block struct {
-	ParentHeader string    `json:"parentHeader"`
-	Header       string    `json:"header"`
-	Signature    string    `json:"signature"`
-	Number       int       `json:"number"`
-	Timestamp    time.Time `json:"timestamp"`
+	ParentHeader string `json:"parentHeader"`
+	Header       string `json:"header"`
+	Signature    string `json:"signature"`
+	Number       int    `json:"number"`
+	Timestamp    int    `json:"timestamp"`
+	BlockNumber  int    `json:"-"`
 }
 
 type Authorities []string
 
 const (
 	stepDuration = 5
-	n            = 7
+	n            = 4
 )
 
+var genesisBlock = Block{
+	Header:       "AAAAAAAAAAAAAAAAAAAAAA==",
+	ParentHeader: "",
+	BlockNumber:  1,
+	Signature:    "",
+	Timestamp:    0,
+	Number:       0,
+}
+
 var BlockChain = map[string]Block{}
+var longestBlockHeader = genesisBlock.Header
+var longestBlockTip = 1
+
+var currentRound = 1
+
+var authorities = []string{"localhost", "10.1.1.153:8080", "10.1.0.178:8000"}
 
 func main() {
-	// authorities := []string{"divya", "jaz", "loong", "noah", "ross", "susruth", "yunshi"}
+	// authorities := []string{"divya", "loong", "susruth", "yunshi"}
+
+	BlockChain[genesisBlock.Header] = genesisBlock
 
 	lastStep := int32(0)
 	var wg sync.WaitGroup
@@ -48,9 +69,11 @@ func main() {
 			select {
 
 			case <-ticker.C:
+				// log.Println("generating block")
 				t := int32(time.Now().Unix())
 				if (t/stepDuration)%n == 0 {
-					generateBlock()
+					generateBlock(currentRound)
+					currentRound += n
 				}
 
 			}
@@ -68,6 +91,8 @@ func main() {
 			case <-ticker.C:
 				t := int32(time.Now().Unix())
 				if lastStep != (t/stepDuration)%n {
+
+					// log.Println("step has changed, propogating blocks")
 					lastStep = (t / stepDuration) % n
 					propogateBlocks()
 				}
@@ -76,8 +101,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("listening at 0.0.0.0:%v...", os.Getenv("PORT"))
-	if err := http.ListenAndServe(fmt.Sprintf("0.0.0.0:%v", os.Getenv("PORT")), NewServer()); err != nil {
+	log.Println("listening at 0.0.0.0:29177...")
+	if err := http.ListenAndServe(":29177", NewServer()); err != nil {
 		log.Fatalf("error listening and serving: %v", err)
 	}
 
@@ -85,9 +110,10 @@ func main() {
 }
 
 func NewServer() http.Handler {
+
 	r := mux.NewRouter().StrictSlash(true)
-	r.HandleFunc("/block", PostHandler()).Methods("POST")
-	r.HandleFunc("/blocks/{title}/page/{page}", GetHandler()).Methods("GET")
+	r.HandleFunc("/blocks", PostHandler()).Methods("POST")
+	r.HandleFunc("/blocks", GetHandler()).Methods("GET")
 	r.Use(RecoveryHandler)
 
 	handler := cors.New(cors.Options{
@@ -102,7 +128,7 @@ func NewServer() http.Handler {
 // PostHandler handles all HTTP POST requests
 func PostHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		postRequest := Block{}
+		postRequest := []Block{}
 		if err := json.NewDecoder(r.Body).Decode(&postRequest); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(fmt.Sprintf("cannot decode json: %v", err)))
@@ -180,21 +206,116 @@ func RecoveryHandler(h http.Handler) http.Handler {
 	})
 }
 
-func HandleBlock(block Block) error {
+func HandleBlock(blocks []Block) error {
+	log.Println("got blocks")
+	for _, block := range blocks {
+		if _, ok := BlockChain[block.Header]; ok {
+			continue
+		}
+		blocknum := block.Number
+
+		longestBlockTip++
+		if blocknum >= longestBlockTip-1 {
+			longestBlockHeader = block.Header
+			block.BlockNumber = longestBlockTip
+			BlockChain[block.Header] = block
+			continue
+		}
+
+		for header, blk := range BlockChain {
+			if blk.BlockNumber >= blocknum {
+				blk.BlockNumber++
+				BlockChain[header] = blk
+			}
+		}
+
+		block.BlockNumber = blocknum
+		BlockChain[block.Header] = block
+	}
 	return nil
 }
 
 func GetBlocks(offset, limit int) []Block {
-	return []Block{}
+	blocks := []Block{}
+	for _, block := range BlockChain {
+		if block.BlockNumber >= offset && block.BlockNumber < limit {
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks
 }
 
-func generateBlock() {
+func generateBlock(currentRound int) error {
 
-	// generate block
+	// generate new block and update longestBlockTip
+	_ = createNewBlockAndUpdateBlockchain(currentRound)
+	blocks := GetBlocks(0, len(BlockChain))
+	// blocks := []Block{block}
+	marshalledBlocks, err := json.Marshal(blocks)
+	if err != nil {
+		return err
+	}
+
+	buf := bytes.NewReader(marshalledBlocks)
+
 	// send to others
-	// replace longest tip
+	for _, auth := range authorities {
+
+		url := fmt.Sprintf("http://" + auth + "/blocks")
+		res, err := http.DefaultClient.Post(url, "application/json", buf)
+		if err != nil {
+			// return err
+			return err
+		}
+		defer res.Body.Close()
+
+		log.Printf("status: %v", res.StatusCode)
+		resText, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			// return err
+			return err
+		}
+		log.Printf("body: %v", string(resText))
+	}
+	return nil
 }
 
 func propogateBlocks() {
 
+}
+
+func createNewBlockAndUpdateBlockchain(currentRound int) Block {
+	header := base64.StdEncoding.EncodeToString(randomBytes())
+	var parentHeader string
+	blockNum := 0
+
+	if lastBlock, ok := BlockChain[longestBlockHeader]; ok {
+		parentHeader = lastBlock.Header
+		blockNum = lastBlock.BlockNumber + 1
+	}
+	block := Block{
+		Header:       header,
+		ParentHeader: parentHeader,
+		BlockNumber:  blockNum,
+		Signature:    header + ":divya",
+		Timestamp:    int(time.Now().Unix()),
+		Number:       currentRound,
+	}
+
+	BlockChain[block.Header] = block
+	longestBlockHeader = block.Header
+	longestBlockTip = block.BlockNumber
+
+	return block
+
+}
+
+// random32Bytes creates a random [32]byte.
+func randomBytes() []byte {
+	key := make([]byte, 64)
+	_, err := rand.Read(key)
+	if err != nil {
+		// handle error here
+	}
+	return key
 }
