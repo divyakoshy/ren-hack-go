@@ -1,0 +1,8 @@
+# Test output
+*.test
+
+# Profile output
+*.out
+
+# Dep
+vendor
